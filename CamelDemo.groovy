@@ -1,11 +1,10 @@
+import com.google.common.base.Stopwatch
 @Grab(group = "org.apache.camel", module = "camel-core", version = "2.0.0")
 @Grab(group='joda-time', module='joda-time', version='2.9.4')
 @Grab(group='com.google.guava', module='guava', version='19.0')
 
-import com.google.common.base.Stopwatch
-
-import org.apache.camel.Exchange
-import org.apache.camel.Processor
+import org.apache.camel.ConsumerTemplate
+import org.apache.camel.Endpoint
 import org.apache.camel.impl.DefaultCamelContext
 import org.apache.camel.builder.RouteBuilder
 
@@ -44,27 +43,40 @@ class QueueProducer {
   }
 }
 
-class QueueProcessor implements Processor {
-  private static final LocalLogger LOG = new LocalLogger(from: QueueProcessor.class)
+class QueueTemplateConsumer implements Runnable {
+  private static final LocalLogger LOG = new LocalLogger(from: QueueTemplateConsumer.class)
 //  private static final Random RND = new Random(System.currentTimeMillis());
   private static final Random RND = new Random(0L);
 
+  private static final int MAX_WAIT_MILLIS = 5_000
+
+  private int number
+  private Endpoint endpoint
+  private ConsumerTemplate template
+
+  private CountDownLatch latch
   private Stopwatch timer
 
   @Override
-  void process(final Exchange ex) throws Exception {
-    final int delay = 1_000 + (RND.nextInt(40) * 100)   //Sleep between 1 and 5 seconds (random incremented by 10ths of a second
+  void run() {
+    Object msg
+    while (msg = template.receive(endpoint, MAX_WAIT_MILLIS)?.in?.body) {
+      final int delay = 1_000 + (RND.nextInt(40) * 100) //Sleep between 1 and 5 seconds (random incremented by 10ths of a second
 
-    LOG.log "Received: [${ex.toString()}]"
-    Thread.sleep(delay)
-    LOG.log "Finished processing for [${ex.toString()}]. Processing took ${delay/1_000} seconds"
-    LOG.log "Processing took ${timer.elapsed(TimeUnit.MILLISECONDS)} milli-seconds so far"
+      LOG.log "${number}: Received: [${msg.toString()}]"
+      Thread.sleep(delay)  //Sleep between 1 and 5 seconds (random incremented by 10ths of a second
+      LOG.log "${number}: Finished processing for [${msg.toString()}]. Processing took ${delay/1_000} seconds"
+      LOG.log "Processing took ${timer.elapsed(TimeUnit.MILLISECONDS)} milli-seconds so far"
+    }
+    LOG.log "Complete"
+    latch?.countDown()
   }
 }
 
 final Stopwatch timer = new Stopwatch()
 timer.start()
 
+final int NUM_THREADS = 5
 final int NUM_MESSAGES = 20
 
 final String SEND_Q = "seda://foo"
@@ -77,10 +89,17 @@ final def ctx = new DefaultCamelContext()
 ctx.addRoutes mrb
 ctx.start()
 
+final CountDownLatch latch = new CountDownLatch(NUM_THREADS)
+final def executor = Executors.newFixedThreadPool(NUM_THREADS)
+
 final def ep = ctx.getEndpoint(RECV_Q)
 
-final def cons = ep.createConsumer(new QueueProcessor(timer: timer))
-cons.start()
+//Using QueueTemplateConsumer
+final def consumerTemplate = ctx.createConsumerTemplate()
+(1..NUM_THREADS).forEach { i ->
+  logger.log "Starting consumer ${i}"
+  executor.execute(new QueueTemplateConsumer(number: i, endpoint: ep, template: consumerTemplate, latch: latch, timer: timer))
+}
 
 logger.log("Starting producer")
 final def p = new QueueProducer(template: ctx.createProducerTemplate(), sendTo: SEND_Q.replaceAll("/", ""))
@@ -89,8 +108,8 @@ final def p = new QueueProducer(template: ctx.createProducerTemplate(), sendTo: 
   Thread.sleep(500)
 }
 
-
-Thread.sleep(60_000)
+latch.await()
 
 timer.stop()
 logger.log "Finished. Took ${timer.elapsed(TimeUnit.MILLISECONDS)} milliseconds"
+executor.shutdown()
